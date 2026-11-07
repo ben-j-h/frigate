@@ -1209,8 +1209,18 @@ class LicensePlateProcessingMixin:
             f"  Selected best cluster {best_cluster_idx + 1}: size {best_size}, max conf {best_max_conf:.3f}"
         )
 
-        # Rep: highest conf in best cluster
-        rep = max(best_cluster, key=lambda v: v["conf"])
+        # Rep: the spelling with the highest summed confidence in the best
+        # cluster, so one high-confidence misread cannot outvote many
+        # consistent reads. Its highest-confidence variant supplies the
+        # confidence, char confidences and area.
+        totals: dict[str, float] = {}
+        for v in best_cluster:
+            totals[v["plate"]] = totals.get(v["plate"], 0.0) + v["conf"]
+        best_text = max(totals, key=lambda t: totals[t])
+        rep = max(
+            (v for v in best_cluster if v["plate"] == best_text),
+            key=lambda v: v["conf"],
+        )
         logger.debug(
             f"  Selected rep from best cluster: '{rep['plate']}' (conf: {rep['conf']:.3f})"
         )
