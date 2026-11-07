@@ -24,6 +24,7 @@ from frigate.data_processing.common.bench_dump import (
     bench_enabled,
     face_recognize_enabled,
     get_dump,
+    setting,
 )
 from frigate.data_processing.common.face.model import (
     ArcFaceRecognizer,
@@ -549,9 +550,9 @@ class FaceRealTimeProcessor(RealTimeProcessorApi):
         FRIGATE_FACE_DUMP_GAP seconds (default 0.5); after FRIGATE_FACE_DUMP_MAX
         crops (default 150) only a face 25% larger than the best so far."""
         n, last, best = self.bench_face_state.get(id, (0, 0.0, 0))
-        if frame_time - last < float(os.environ.get("FRIGATE_FACE_DUMP_GAP", "0.5")):
+        if frame_time - last < float(setting("FRIGATE_FACE_DUMP_GAP", "0.5")):
             return False
-        if n >= int(os.environ.get("FRIGATE_FACE_DUMP_MAX", "150")):
+        if n >= int(setting("FRIGATE_FACE_DUMP_MAX", "150")):
             # face size unknown yet (pre-check): decide once it is
             return face_area is None or face_area > 1.25 * best
         return True
@@ -569,39 +570,42 @@ class FaceRealTimeProcessor(RealTimeProcessorApi):
     ) -> None:
         """Fork-only evaluation dump of the exact face crop (see bench_dump),
         with the geometry needed to check the face belongs to this person."""
-        frame_time = obj_data.get("frame_time", start)
-        others: list[dict[str, Any]] = []
-        for other_id, (t, box) in self.bench_people.get(camera, {}).items():
-            if other_id == id or abs(frame_time - t) > 1.0:
-                continue
-            if (
-                box[0] < face_box[2]
-                and face_box[0] < box[2]
-                and box[1] < face_box[3]
-                and face_box[1] < box[3]
-            ):
-                others.append(
-                    {"id": other_id, "box": box, "dt": round(t - frame_time, 3)}
-                )
-        get_dump(self.config, "faces", "person").save(
-            camera,
-            id,
-            int(frame_time * 1000),
-            face_frame,
-            {
-                "t": round(float(frame_time), 3),
-                "face_box": [int(x) for x in face_box],
-                "face_score": round(float(face_score), 3)
-                if face_score is not None
-                else None,
-                "person_box": [int(x) for x in obj_data.get("box") or []],
-                "person_score": obj_data.get("score"),
-                "sub_label": obj_data.get("sub_label"),
-                "others": others,
-                "frigate": [res[0], round(float(res[1]), 3)] if res else None,
-                "attempt": self.bench_face_state.get(id, [0])[0] + 1,
-            },
-        )
+        try:
+            frame_time = obj_data.get("frame_time", start)
+            others: list[dict[str, Any]] = []
+            for other_id, (t, box) in self.bench_people.get(camera, {}).items():
+                if other_id == id or abs(frame_time - t) > 1.0:
+                    continue
+                if (
+                    box[0] < face_box[2]
+                    and face_box[0] < box[2]
+                    and box[1] < face_box[3]
+                    and face_box[1] < box[3]
+                ):
+                    others.append(
+                        {"id": other_id, "box": box, "dt": round(t - frame_time, 3)}
+                    )
+            get_dump(self.config, "faces", "person").save(
+                camera,
+                id,
+                int(frame_time * 1000),
+                face_frame,
+                {
+                    "t": round(float(frame_time), 3),
+                    "face_box": [int(x) for x in face_box],
+                    "face_score": round(float(face_score), 3)
+                    if face_score is not None
+                    else None,
+                    "person_box": [int(x) for x in obj_data.get("box") or []],
+                    "person_score": obj_data.get("score"),
+                    "sub_label": obj_data.get("sub_label"),
+                    "others": others,
+                    "frigate": [res[0], round(float(res[1]), 3)] if res else None,
+                    "attempt": self.bench_face_state.get(id, [0])[0] + 1,
+                },
+            )
+        except Exception as e:  # the dump never stops face processing
+            logger.debug(f"{camera}: face bench dump failed: {e}")
 
     def expire_object(self, object_id: str, camera: str) -> None:
         self.bench_people.get(camera, {}).pop(object_id, None)

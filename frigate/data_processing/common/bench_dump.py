@@ -6,8 +6,11 @@ Frigate's topic_prefix (so Home Assistant, which only listens to frigate/...,
 never sees it). Crops are kept as long as the camera keeps snapshots for the
 object (snapshots.retain), checked hourly.
 
-Switched only by environment variables, so removing the patched files never
-leaves a config the stock image rejects:
+Switched by KEY=VALUE lines in /config/bench_dump.env (re-read every minute;
+an environment variable of the same name wins, but Frigate's worker processes
+start from a stripped environment, so the file is what works). Stock Frigate
+ignores the file, so removing the patched files never leaves a config it
+rejects:
   FRIGATE_BENCH_DUMP=1              enable the dump (faces and plates)
   FRIGATE_BENCH_MQTT_TOPIC=<root>   MQTT topic root (default frigate_bench,
                                     empty = no MQTT); records go to <root>/<kind>
@@ -39,12 +42,38 @@ BENCH_DIR = os.path.join(CLIPS_DIR, "bench")
 PRUNE_INTERVAL = 3600
 
 
+CONF_FILE = "/config/bench_dump.env"
+CONF_TTL = 60
+_conf: dict[str, str] = {}
+_conf_read = 0.0
+
+
+def setting(key: str, default: str) -> str:
+    """Environment variable, else /config/bench_dump.env (cached CONF_TTL s)."""
+    global _conf, _conf_read
+    if key in os.environ:
+        return os.environ[key]
+    if time.time() - _conf_read > CONF_TTL:
+        conf: dict[str, str] = {}
+        try:
+            with open(CONF_FILE) as f:
+                for line in f:
+                    line = line.split("#", 1)[0].strip()
+                    k, sep, v = line.partition("=")
+                    if sep:
+                        conf[k.strip()] = v.strip().strip('"')
+        except OSError:
+            pass
+        _conf, _conf_read = conf, time.time()
+    return _conf.get(key, default)
+
+
 def bench_enabled() -> bool:
-    return os.environ.get("FRIGATE_BENCH_DUMP", "0") == "1"
+    return setting("FRIGATE_BENCH_DUMP", "0") == "1"
 
 
 def face_recognize_enabled() -> bool:
-    return os.environ.get("FRIGATE_FACE_RECOGNIZE", "1") != "0"
+    return setting("FRIGATE_FACE_RECOGNIZE", "1") != "0"
 
 
 _dumps: dict[str, "BenchDump"] = {}
@@ -64,7 +93,7 @@ class BenchDump:
         self.kind = kind
         self.label = label  # object whose snapshot retention applies
         self.root = os.path.join(BENCH_DIR, kind)
-        self.topic_root = os.environ.get("FRIGATE_BENCH_MQTT_TOPIC", "frigate_bench")
+        self.topic_root = setting("FRIGATE_BENCH_MQTT_TOPIC", "frigate_bench")
         self.client: Any = None
         self.last_prune = 0.0
         self.lock = threading.Lock()

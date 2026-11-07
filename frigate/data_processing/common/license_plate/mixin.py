@@ -242,22 +242,29 @@ class LicensePlateProcessingMixin:
         confidences: list[list[float]],
     ) -> None:
         """Fork-only evaluation dump of the exact OCR input (see bench_dump)."""
-        raw = self.last_raw_read
-        get_dump(self.config, "lpr", "car").save(
-            camera,
-            id,
-            debug_frame_id,
-            image,
-            {
-                "t": round(float(frame_time), 3),
-                "box": [int(x) for x in plate_box] if plate_box is not None else None,
-                "model": str(self.lpr_config.recognition_model.value),
-                "threshold": self.lpr_config.recognition_threshold,
-                "raw": [raw[0], [round(float(c), 3) for c in raw[1]]] if raw else None,
-                "plates": plates,
-                "confs": [[round(float(c), 3) for c in cs] for cs in confidences],
-            },
-        )
+        try:
+            raw = self.last_raw_read
+            get_dump(self.config, "lpr", "car").save(
+                camera,
+                id,
+                debug_frame_id,
+                image,
+                {
+                    "t": round(float(frame_time), 3),
+                    "box": [int(x) for x in plate_box]
+                    if plate_box is not None
+                    else None,
+                    "model": str(self.lpr_config.recognition_model.value),
+                    "threshold": self.lpr_config.recognition_threshold,
+                    "raw": [raw[0], [round(float(c), 3) for c in raw[1]]]
+                    if raw
+                    else None,
+                    "plates": plates,
+                    "confs": [[round(float(c), 3) for c in cs] for cs in confidences],
+                },
+            )
+        except Exception as e:  # the dump never stops plate recognition
+            logger.debug(f"{camera}: LPR bench dump failed: {e}")
 
     def _process_license_plate_whole(
         self, camera: str, id: str, image: np.ndarray, debug_frame_id: int
