@@ -25,6 +25,7 @@ from frigate.data_processing.common.bench_dump import (
     face_recognize_enabled,
     get_dump,
     setting,
+    yuv_box_to_bgr,
 )
 from frigate.data_processing.common.face.model import (
     ArcFaceRecognizer,
@@ -68,6 +69,8 @@ class FaceRealTimeProcessor(RealTimeProcessorApi):
         self.bench_people: dict[str, dict[str, tuple[float, list[int]]]] = {}
         # bench dump sampling state per person: [crops, last frame time, best area]
         self.bench_face_state: dict[str, list] = {}
+        # bench dump: person (body) crops per person: [crops, last frame time]
+        self.bench_person_state: dict[str, list] = {}
         self.recognizer: FaceRecognizer
         self.faces_per_second = EventsPerSecond()
         self.inference_speed = InferenceSpeed(self.metrics.face_rec_speed)
@@ -211,6 +214,7 @@ class FaceRealTimeProcessor(RealTimeProcessorApi):
                 obj_data.get("frame_time", start),
                 list(obj_data["box"]),
             )
+            self._bench_person(camera, id, obj_data, frame, start)
 
         # Frigate's recognizer keeps its stock limits; past them (or with the
         # recognizer off) the bench dump keeps sampling the whole track
@@ -296,14 +300,19 @@ class FaceRealTimeProcessor(RealTimeProcessorApi):
             ):
                 return
 
-            face_frame = cv2.cvtColor(frame, cv2.COLOR_YUV2BGR_I420)
             frame_face_box = list(face_box)
             face_score = face.get("score")
 
-            face_frame = face_frame[
-                max(0, face_box[1]) : min(frame.shape[0], face_box[3]),
-                max(0, face_box[0]) : min(frame.shape[1], face_box[2]),
-            ]
+            if stock_ok:  # Frigate's recognizer: stock crop
+                face_frame = cv2.cvtColor(frame, cv2.COLOR_YUV2BGR_I420)
+                face_frame = face_frame[
+                    max(0, face_box[1]) : min(frame.shape[0], face_box[3]),
+                    max(0, face_box[0]) : min(frame.shape[1], face_box[2]),
+                ]
+            else:  # bench dump only: convert just the face region (~7x cheaper)
+                face_frame = yuv_box_to_bgr(frame, face_box)
+                if face_frame is None:
+                    return
 
         if face_frame.size == 0:
             logger.debug(f"Empty face crop for {id}")
@@ -557,6 +566,73 @@ class FaceRealTimeProcessor(RealTimeProcessorApi):
             return face_area is None or face_area > 1.25 * best
         return True
 
+    def _bench_person(
+        self,
+        camera: str,
+        id: str,
+        obj_data: dict[str, Any],
+        frame: np.ndarray,
+        start: float,
+    ) -> None:
+        """Fork-only bench dump of the tracked person's body crop (exactly the
+        person box, as JPEG) over the whole track, for body re-ID: one per
+        FRIGATE_PERSON_DUMP_GAP s (default 1.0; FRIGATE_PERSON_DUMP_STATIONARY_GAP,
+        default 10, while stationary), at most FRIGATE_PERSON_DUMP_MAX (default
+        120) per event, with the other tracked people whose box overlaps it."""
+        try:
+            frame_time = obj_data.get("frame_time", start)
+            gap = float(setting("FRIGATE_PERSON_DUMP_GAP", "1.0"))
+            if obj_data.get("stationary"):
+                gap = max(
+                    gap, float(setting("FRIGATE_PERSON_DUMP_STATIONARY_GAP", "10"))
+                )
+            st = self.bench_person_state.setdefault(id, [0, 0.0])
+            if frame_time - st[1] < gap or st[0] >= int(
+                setting("FRIGATE_PERSON_DUMP_MAX", "120")
+            ):
+                return
+            box = [int(x) for x in obj_data["box"]]
+            if box[3] - box[1] < 64 or box[2] - box[0] < 16:
+                return
+            crop = yuv_box_to_bgr(frame, box)
+            if crop is None:
+                return
+            others: list[dict[str, Any]] = []
+            for other_id, (t, ob) in self.bench_people.get(camera, {}).items():
+                if other_id == id or abs(frame_time - t) > 1.0:
+                    continue
+                if (
+                    ob[0] < box[2]
+                    and box[0] < ob[2]
+                    and ob[1] < box[3]
+                    and box[1] < ob[3]
+                ):
+                    others.append(
+                        {"id": other_id, "box": ob, "dt": round(t - frame_time, 3)}
+                    )
+            st[0] += 1
+            st[1] = frame_time
+            get_dump(self.config, "person", "person").save(
+                camera,
+                id,
+                int(frame_time * 1000),
+                crop,
+                {
+                    "t": round(float(frame_time), 3),
+                    "person_box": box,
+                    "crop_wh": [int(crop.shape[1]), int(crop.shape[0])],
+                    "frame_wh": [int(frame.shape[1]), int(frame.shape[0] * 2 // 3)],
+                    "score": obj_data.get("score"),
+                    "stationary": bool(obj_data.get("stationary")),
+                    "zones": obj_data.get("current_zones") or [],
+                    "others": others,
+                    "n": st[0],
+                },
+                ext="jpg",
+            )
+        except Exception as e:  # the dump never stops face processing
+            logger.debug(f"{camera}: person bench dump failed: {e}")
+
     def _bench_face(
         self,
         camera: str,
@@ -610,6 +686,7 @@ class FaceRealTimeProcessor(RealTimeProcessorApi):
     def expire_object(self, object_id: str, camera: str) -> None:
         self.bench_people.get(camera, {}).pop(object_id, None)
         self.bench_face_state.pop(object_id, None)
+        self.bench_person_state.pop(object_id, None)
         if object_id in self.person_face_history:
             self.person_face_history.pop(object_id)
 

@@ -68,6 +68,28 @@ def setting(key: str, default: str) -> str:
     return _conf.get(key, default)
 
 
+def yuv_box_to_bgr(frame: np.ndarray, box: Any) -> np.ndarray | None:
+    """BGR crop of box [x1, y1, x2, y2] from an I420 frame, converting only that
+    region (x snapped to even, height to a multiple of 4, as I420 needs)."""
+    H, W = frame.shape[0] * 2 // 3, frame.shape[1]
+    x1, y1 = max(0, int(box[0])) // 2 * 2, max(0, int(box[1])) // 2 * 2
+    x2, y2 = min(W, int(box[2])) // 2 * 2, min(H, int(box[3]))
+    y2 = y1 + (y2 - y1) // 4 * 4
+    if x2 - x1 < 2 or y2 - y1 < 4:
+        return None
+    u = frame[H : H + H // 4].reshape(H // 2, W // 2)
+    v = frame[H + H // 4 : H + H // 2].reshape(H // 2, W // 2)
+    h, w = y2 - y1, x2 - x1
+    buf = np.concatenate(
+        [
+            frame[y1:y2, x1:x2].ravel(),
+            u[y1 // 2 : y2 // 2, x1 // 2 : x2 // 2].ravel(),
+            v[y1 // 2 : y2 // 2, x1 // 2 : x2 // 2].ravel(),
+        ]
+    ).reshape(h * 3 // 2, w)
+    return cv2.cvtColor(buf, cv2.COLOR_YUV2BGR_I420)
+
+
 def bench_enabled() -> bool:
     return setting("FRIGATE_BENCH_DUMP", "0") == "1"
 
@@ -136,14 +158,16 @@ class BenchDump:
         frame_id: int,
         image: np.ndarray,
         record: dict[str, Any],
+        ext: str = "png",
     ) -> None:
         """Write the crop and its JSON line, publish the record, prune hourly."""
         try:
-            rel = f"bench/{self.kind}/{camera}/{event_id}/{frame_id}.png"
+            rel = f"bench/{self.kind}/{camera}/{event_id}/{frame_id}.{ext}"
             os.makedirs(
                 os.path.join(BENCH_DIR, self.kind, camera, event_id), exist_ok=True
             )
-            cv2.imwrite(os.path.join(CLIPS_DIR, rel), image)
+            params = [cv2.IMWRITE_JPEG_QUALITY, 92] if ext == "jpg" else []
+            cv2.imwrite(os.path.join(CLIPS_DIR, rel), image, params)
             record = {
                 "kind": self.kind,
                 "camera": camera,
