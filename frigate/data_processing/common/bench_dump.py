@@ -1,0 +1,170 @@
+"""Evaluation dump for the ben-j-h fork (not part of any upstream proposal).
+
+Saves the exact crops given to the face and plate recognition models, one JSON
+line per pass, and announces each record on MQTT under a topic root outside
+Frigate's topic_prefix (so Home Assistant, which only listens to frigate/...,
+never sees it). Crops are kept as long as the camera keeps snapshots for the
+object (snapshots.retain), checked hourly.
+
+Switched only by environment variables, so removing the patched files never
+leaves a config the stock image rejects:
+  FRIGATE_BENCH_DUMP=1              enable the dump (faces and plates)
+  FRIGATE_BENCH_MQTT_TOPIC=<root>   MQTT topic root (default frigate_bench,
+                                    empty = no MQTT); records go to <root>/<kind>
+  FRIGATE_FACE_RECOGNIZE=0          skip Frigate's own face recognizer
+                                    (crops are still dumped)
+
+Files: clips/bench/<kind>/<camera>/<event id>/<frame id>.png and
+clips/bench/<kind>/reads-YYYY-MM-DD.jsonl (UTC date).
+"""
+
+import datetime
+import json
+import logging
+import os
+import shutil
+import threading
+import time
+from typing import Any
+
+import cv2
+import numpy as np
+
+from frigate.config import FrigateConfig
+from frigate.const import CLIPS_DIR
+
+logger = logging.getLogger(__name__)
+
+BENCH_DIR = os.path.join(CLIPS_DIR, "bench")
+PRUNE_INTERVAL = 3600
+
+
+def bench_enabled() -> bool:
+    return os.environ.get("FRIGATE_BENCH_DUMP", "0") == "1"
+
+
+def face_recognize_enabled() -> bool:
+    return os.environ.get("FRIGATE_FACE_RECOGNIZE", "1") != "0"
+
+
+_dumps: dict[str, "BenchDump"] = {}
+
+
+def get_dump(config: FrigateConfig, kind: str, label: str) -> "BenchDump":
+    """One dump (and one MQTT client) per kind per process: the real-time and
+    post processors share it, so client ids never collide."""
+    if kind not in _dumps:
+        _dumps[kind] = BenchDump(config, kind, label)
+    return _dumps[kind]
+
+
+class BenchDump:
+    def __init__(self, config: FrigateConfig, kind: str, label: str) -> None:
+        self.config = config
+        self.kind = kind
+        self.label = label  # object whose snapshot retention applies
+        self.root = os.path.join(BENCH_DIR, kind)
+        self.topic_root = os.environ.get("FRIGATE_BENCH_MQTT_TOPIC", "frigate_bench")
+        self.client: Any = None
+        self.last_prune = 0.0
+        self.lock = threading.Lock()
+
+        if self.topic_root and config.mqtt.enabled:
+            self._start_mqtt()
+
+    def _start_mqtt(self) -> None:
+        try:
+            import paho.mqtt.client as mqtt
+            from paho.mqtt.enums import CallbackAPIVersion
+
+            m = self.config.mqtt
+            client = mqtt.Client(
+                callback_api_version=CallbackAPIVersion.VERSION2,
+                client_id=f"{m.client_id}-bench-{self.kind}-{os.getpid()}",
+            )
+            if m.user is not None:
+                client.username_pw_set(m.user, password=m.password)
+            if m.tls_ca_certs is not None:
+                client.tls_set(m.tls_ca_certs, m.tls_client_cert, m.tls_client_key)
+                if m.tls_insecure is not None:
+                    client.tls_insecure_set(m.tls_insecure)
+            client.connect_async(m.host, m.port, 60)
+            client.loop_start()
+            self.client = client
+        except Exception as e:
+            logger.warning(f"Bench dump MQTT unavailable: {e}")
+            self.client = None
+
+    def _retain_days(self, camera: str) -> float:
+        cam = self.config.cameras.get(camera)
+        retain = cam.snapshots.retain if cam else self.config.snapshots.retain
+        return retain.objects.get(self.label, retain.default)
+
+    def save(
+        self,
+        camera: str,
+        event_id: str,
+        frame_id: int,
+        image: np.ndarray,
+        record: dict[str, Any],
+    ) -> None:
+        """Write the crop and its JSON line, publish the record, prune hourly."""
+        try:
+            rel = f"bench/{self.kind}/{camera}/{event_id}/{frame_id}.png"
+            os.makedirs(
+                os.path.join(BENCH_DIR, self.kind, camera, event_id), exist_ok=True
+            )
+            cv2.imwrite(os.path.join(CLIPS_DIR, rel), image)
+            record = {
+                "kind": self.kind,
+                "camera": camera,
+                "id": event_id,
+                "frame_id": frame_id,
+                "file": rel,
+                **record,
+            }
+            line = json.dumps(record)
+            day = datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%d")
+            with self.lock:
+                with open(os.path.join(self.root, f"reads-{day}.jsonl"), "a") as f:
+                    f.write(line + "\n")
+            if self.client is not None:
+                self.client.publish(f"{self.topic_root}/{self.kind}", line, qos=0)
+        except Exception as e:
+            logger.debug(f"{camera}: bench dump ({self.kind}) failed: {e}")
+
+        if time.time() - self.last_prune > PRUNE_INTERVAL:
+            self.last_prune = time.time()
+            threading.Thread(target=self._prune, daemon=True).start()
+
+    def _prune(self) -> None:
+        """Delete event folders older than the camera's snapshot retention, and
+        JSON line files older than the longest retention."""
+        now = time.time()
+        longest = 0.0
+        try:
+            for camera in os.listdir(self.root):
+                cam_dir = os.path.join(self.root, camera)
+                if not os.path.isdir(cam_dir):
+                    continue
+                days = self._retain_days(camera)
+                longest = max(longest, days)
+                for event_id in os.listdir(cam_dir):
+                    try:
+                        start = float(event_id.split("-")[0])
+                    except ValueError:
+                        start = os.path.getmtime(os.path.join(cam_dir, event_id))
+                    if now - start > days * 86400:
+                        shutil.rmtree(
+                            os.path.join(cam_dir, event_id), ignore_errors=True
+                        )
+            longest = longest or self.config.snapshots.retain.default
+            for name in os.listdir(self.root):
+                if name.startswith("reads-") and name.endswith(".jsonl"):
+                    path = os.path.join(self.root, name)
+                    if now - os.path.getmtime(path) > (longest + 1) * 86400:
+                        os.remove(path)
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            logger.debug(f"bench dump ({self.kind}) prune failed: {e}")

@@ -20,6 +20,11 @@ from frigate.comms.event_metadata_updater import (
 from frigate.comms.inter_process import InterProcessRequestor
 from frigate.config import FrigateConfig
 from frigate.const import FACE_DIR, MODEL_CACHE_DIR
+from frigate.data_processing.common.bench_dump import (
+    bench_enabled,
+    face_recognize_enabled,
+    get_dump,
+)
 from frigate.data_processing.common.face.model import (
     ArcFaceRecognizer,
     FaceNetRecognizer,
@@ -57,6 +62,11 @@ class FaceRealTimeProcessor(RealTimeProcessorApi):
         self.requires_face_detection = "face" not in self.config.objects.all_objects
         self.person_face_history: dict[str, list[tuple[str, float, int]]] = {}
         self.camera_current_people: dict[str, list[str]] = {}
+        # bench dump: latest box per person per camera, to list other people
+        # whose box overlaps a face (camera -> id -> (frame_time, box))
+        self.bench_people: dict[str, dict[str, tuple[float, list[int]]]] = {}
+        # bench dump sampling state per person: [crops, last frame time, best area]
+        self.bench_face_state: dict[str, list] = {}
         self.recognizer: FaceRecognizer
         self.faces_per_second = EventsPerSecond()
         self.inference_speed = InferenceSpeed(self.metrics.face_rec_speed)
@@ -195,30 +205,21 @@ class FaceRealTimeProcessor(RealTimeProcessorApi):
             logger.debug("Not processing face for a non person object.")
             return
 
-        # don't overwrite sub label for objects that have a sub label
-        # that is not a face
-        if obj_data.get("sub_label") and id not in self.person_face_history:
-            logger.debug(
-                f"Not processing face due to existing sub label: {obj_data.get('sub_label')}."
+        if bench_enabled() and obj_data.get("box"):
+            self.bench_people.setdefault(camera, {})[id] = (
+                obj_data.get("frame_time", start),
+                list(obj_data["box"]),
             )
-            return
 
-        # check if we have hit limits
-        if (
-            id in self.person_face_history
-            and len(self.person_face_history[id]) >= MAX_FACES_ATTEMPTS_AFTER_REC
+        # Frigate's recognizer keeps its stock limits; past them (or with the
+        # recognizer off) the bench dump keeps sampling the whole track
+        stock_ok = face_recognize_enabled() and self._stock_attempt_ok(id, obj_data)
+        frame_time = obj_data.get("frame_time", start)
+
+        if not stock_ok and not (
+            bench_enabled() and self._bench_face_due(id, frame_time, None)
         ):
-            # if we are at max attempts after rec and we have a rec
-            if obj_data.get("sub_label"):
-                logger.debug(
-                    "Not processing due to hitting max attempts after true recognition."
-                )
-                return
-
-            # if we don't have a rec and are at max attempts
-            if len(self.person_face_history[id]) >= MAX_FACE_ATTEMPTS:
-                logger.debug("Not processing due to hitting max rec attempts.")
-                return
+            return
 
         face: dict[str, Any] | None = None
 
@@ -244,6 +245,13 @@ class FaceRealTimeProcessor(RealTimeProcessorApi):
                 max(0, face_box[1]) : min(frame.shape[0], face_box[3]),
                 max(0, face_box[0]) : min(frame.shape[1], face_box[2]),
             ]
+            frame_face_box = [
+                face_box[0] + left,
+                face_box[1] + top,
+                face_box[2] + left,
+                face_box[3] + top,
+            ]
+            face_score = None
 
             # check that face is correct size
             if area(face_box) < self.config.cameras[camera].face_recognition.min_area:
@@ -282,7 +290,14 @@ class FaceRealTimeProcessor(RealTimeProcessorApi):
                 logger.debug(f"Invalid face box {face}")
                 return
 
+            if not stock_ok and not self._bench_face_due(
+                id, frame_time, area(face_box)
+            ):
+                return
+
             face_frame = cv2.cvtColor(frame, cv2.COLOR_YUV2BGR_I420)
+            frame_face_box = list(face_box)
+            face_score = face.get("score")
 
             face_frame = face_frame[
                 max(0, face_box[1]) : min(frame.shape[0], face_box[3]),
@@ -293,7 +308,23 @@ class FaceRealTimeProcessor(RealTimeProcessorApi):
             logger.debug(f"Empty face crop for {id}")
             return
 
-        res = self.recognizer.classify(face_frame)
+        res = self.recognizer.classify(face_frame) if stock_ok else None
+        face_area = face_frame.shape[0] * face_frame.shape[1]
+
+        if bench_enabled() and (
+            stock_ok or self._bench_face_due(id, frame_time, face_area)
+        ):
+            self._bench_face(
+                camera, id, obj_data, start, face_frame, frame_face_box, face_score, res
+            )
+            st = self.bench_face_state.setdefault(id, [0, 0.0, 0])
+            st[0] += 1
+            st[1] = frame_time
+            st[2] = max(st[2], face_area)
+
+        if not stock_ok:
+            self.__update_metrics(datetime.datetime.now().timestamp() - start)
+            return
 
         if not res:
             logger.debug(f"Face recognizer returned no result for {id}")
@@ -482,7 +513,99 @@ class FaceRealTimeProcessor(RealTimeProcessorApi):
 
         return None
 
+    def _stock_attempt_ok(self, id: str, obj_data: dict[str, Any]) -> bool:
+        """Frigate's own per-person attempt limits (unchanged)."""
+        # don't overwrite sub label for objects that have a sub label
+        # that is not a face
+        if obj_data.get("sub_label") and id not in self.person_face_history:
+            logger.debug(
+                f"Not processing face due to existing sub label: {obj_data.get('sub_label')}."
+            )
+            return False
+
+        # check if we have hit limits
+        if (
+            id in self.person_face_history
+            and len(self.person_face_history[id]) >= MAX_FACES_ATTEMPTS_AFTER_REC
+        ):
+            # if we are at max attempts after rec and we have a rec
+            if obj_data.get("sub_label"):
+                logger.debug(
+                    "Not processing due to hitting max attempts after true recognition."
+                )
+                return False
+
+            # if we don't have a rec and are at max attempts
+            if len(self.person_face_history[id]) >= MAX_FACE_ATTEMPTS:
+                logger.debug("Not processing due to hitting max rec attempts.")
+                return False
+
+        return True
+
+    def _bench_face_due(
+        self, id: str, frame_time: float, face_area: int | None
+    ) -> bool:
+        """Bench dump sampling over the whole track: at most one crop per
+        FRIGATE_FACE_DUMP_GAP seconds (default 0.5); after FRIGATE_FACE_DUMP_MAX
+        crops (default 150) only a face 25% larger than the best so far."""
+        n, last, best = self.bench_face_state.get(id, (0, 0.0, 0))
+        if frame_time - last < float(os.environ.get("FRIGATE_FACE_DUMP_GAP", "0.5")):
+            return False
+        if n >= int(os.environ.get("FRIGATE_FACE_DUMP_MAX", "150")):
+            # face size unknown yet (pre-check): decide once it is
+            return face_area is None or face_area > 1.25 * best
+        return True
+
+    def _bench_face(
+        self,
+        camera: str,
+        id: str,
+        obj_data: dict[str, Any],
+        start: float,
+        face_frame: np.ndarray,
+        face_box: list[int],
+        face_score: float | None,
+        res: tuple[str, float] | None,
+    ) -> None:
+        """Fork-only evaluation dump of the exact face crop (see bench_dump),
+        with the geometry needed to check the face belongs to this person."""
+        frame_time = obj_data.get("frame_time", start)
+        others: list[dict[str, Any]] = []
+        for other_id, (t, box) in self.bench_people.get(camera, {}).items():
+            if other_id == id or abs(frame_time - t) > 1.0:
+                continue
+            if (
+                box[0] < face_box[2]
+                and face_box[0] < box[2]
+                and box[1] < face_box[3]
+                and face_box[1] < box[3]
+            ):
+                others.append(
+                    {"id": other_id, "box": box, "dt": round(t - frame_time, 3)}
+                )
+        get_dump(self.config, "faces", "person").save(
+            camera,
+            id,
+            int(frame_time * 1000),
+            face_frame,
+            {
+                "t": round(float(frame_time), 3),
+                "face_box": [int(x) for x in face_box],
+                "face_score": round(float(face_score), 3)
+                if face_score is not None
+                else None,
+                "person_box": [int(x) for x in obj_data.get("box") or []],
+                "person_score": obj_data.get("score"),
+                "sub_label": obj_data.get("sub_label"),
+                "others": others,
+                "frigate": [res[0], round(float(res[1]), 3)] if res else None,
+                "attempt": self.bench_face_state.get(id, [0])[0] + 1,
+            },
+        )
+
     def expire_object(self, object_id: str, camera: str) -> None:
+        self.bench_people.get(camera, {}).pop(object_id, None)
+        self.bench_face_state.pop(object_id, None)
         if object_id in self.person_face_history:
             self.person_face_history.pop(object_id)
 

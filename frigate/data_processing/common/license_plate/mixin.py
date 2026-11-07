@@ -26,6 +26,7 @@ from frigate.comms.inter_process import InterProcessRequestor
 from frigate.config import FrigateConfig
 from frigate.config.classification import LicensePlateRecognitionConfig
 from frigate.const import CLIPS_DIR, MODEL_CACHE_DIR
+from frigate.data_processing.common.bench_dump import bench_enabled, get_dump
 from frigate.data_processing.common.license_plate.model import LicensePlateModelRunner
 from frigate.embeddings.onnx.lpr_embedding import LPR_EMBEDDING_SIZE
 from frigate.types import TrackedObjectUpdateTypesEnum
@@ -240,35 +241,23 @@ class LicensePlateProcessingMixin:
         plates: list[str],
         confidences: list[list[float]],
     ) -> None:
-        """Save every plate crop given to the OCR model, plus one JSON line per
-        pass, so other recognition models can be re-run on exactly the same
-        inputs later. Files: lpr/{camera}/{id}/{debug_frame_id}_in.png and
-        lpr/reads-YYYY-MM-DD.jsonl (UTC date)."""
-        try:
-            rel = f"lpr/{camera}/{id}/{debug_frame_id}_in.png"
-            Path(os.path.join(CLIPS_DIR, f"lpr/{camera}/{id}")).mkdir(
-                parents=True, exist_ok=True
-            )
-            cv2.imwrite(os.path.join(CLIPS_DIR, rel), image)
-            raw = self.last_raw_read
-            record = {
+        """Fork-only evaluation dump of the exact OCR input (see bench_dump)."""
+        raw = self.last_raw_read
+        get_dump(self.config, "lpr", "car").save(
+            camera,
+            id,
+            debug_frame_id,
+            image,
+            {
                 "t": round(float(frame_time), 3),
-                "camera": camera,
-                "id": id,
-                "frame_id": debug_frame_id,
                 "box": [int(x) for x in plate_box] if plate_box is not None else None,
-                "file": rel,
                 "model": str(self.lpr_config.recognition_model.value),
                 "threshold": self.lpr_config.recognition_threshold,
                 "raw": [raw[0], [round(float(c), 3) for c in raw[1]]] if raw else None,
                 "plates": plates,
                 "confs": [[round(float(c), 3) for c in cs] for cs in confidences],
-            }
-            day = datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%d")
-            with open(os.path.join(CLIPS_DIR, f"lpr/reads-{day}.jsonl"), "a") as f:
-                f.write(json.dumps(record) + "\n")
-        except Exception as e:
-            logger.debug(f"{camera}: LPR bench dump failed: {e}")
+            },
+        )
 
     def _process_license_plate_whole(
         self, camera: str, id: str, image: np.ndarray, debug_frame_id: int
@@ -1600,7 +1589,7 @@ class LicensePlateProcessingMixin:
         self.plates_rec_second.update()
         self.plate_rec_speed.update(datetime.datetime.now().timestamp() - start)
 
-        if self.config.lpr.debug_save_plates:
+        if bench_enabled():
             frame_time = (
                 start if dedicated_lpr else obj_data.get("frame_time", start)  # type: ignore[union-attr]
             )
