@@ -86,6 +86,10 @@ class LicensePlateProcessingMixin:
         self.similarity_threshold = 0.8
         self.cluster_threshold = 0.85
 
+        # bench dump: the raw read of the last whole-plate OCR pass, before
+        # recognition_threshold (None for the paddleocr path)
+        self.last_raw_read: tuple[str, list[float]] | None = None
+
     def _detect(self, image: np.ndarray, debug_frame_id: int) -> list[np.ndarray]:
         """
         Detect possible areas of text in the input image by first resizing and normalizing it,
@@ -225,6 +229,47 @@ class LicensePlateProcessingMixin:
 
         return plate
 
+    def _bench_dump(
+        self,
+        camera: str,
+        id: str,
+        debug_frame_id: int,
+        frame_time: float,
+        plate_box: Any,
+        image: np.ndarray,
+        plates: list[str],
+        confidences: list[list[float]],
+    ) -> None:
+        """Save every plate crop given to the OCR model, plus one JSON line per
+        pass, so other recognition models can be re-run on exactly the same
+        inputs later. Files: lpr/{camera}/{id}/{debug_frame_id}_in.png and
+        lpr/reads-YYYY-MM-DD.jsonl (UTC date)."""
+        try:
+            rel = f"lpr/{camera}/{id}/{debug_frame_id}_in.png"
+            Path(os.path.join(CLIPS_DIR, f"lpr/{camera}/{id}")).mkdir(
+                parents=True, exist_ok=True
+            )
+            cv2.imwrite(os.path.join(CLIPS_DIR, rel), image)
+            raw = self.last_raw_read
+            record = {
+                "t": round(float(frame_time), 3),
+                "camera": camera,
+                "id": id,
+                "frame_id": debug_frame_id,
+                "box": [int(x) for x in plate_box] if plate_box is not None else None,
+                "file": rel,
+                "model": str(self.lpr_config.recognition_model.value),
+                "threshold": self.lpr_config.recognition_threshold,
+                "raw": [raw[0], [round(float(c), 3) for c in raw[1]]] if raw else None,
+                "plates": plates,
+                "confs": [[round(float(c), 3) for c in cs] for cs in confidences],
+            }
+            day = datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%d")
+            with open(os.path.join(CLIPS_DIR, f"lpr/reads-{day}.jsonl"), "a") as f:
+                f.write(json.dumps(record) + "\n")
+        except Exception as e:
+            logger.debug(f"{camera}: LPR bench dump failed: {e}")
+
     def _process_license_plate_whole(
         self, camera: str, id: str, image: np.ndarray, debug_frame_id: int
     ) -> tuple[list[str], list[list[float]], list[int]]:
@@ -255,6 +300,8 @@ class LicensePlateProcessingMixin:
         except Exception as e:
             logger.warning(f"Error running plate OCR model: {e}")
             return [], [], []
+
+        self.last_raw_read = (plate, confidences)
 
         if not plate:
             return [], [], []
@@ -1546,11 +1593,27 @@ class LicensePlateProcessingMixin:
 
         # run detection, returns results sorted by confidence, best first
         start = datetime.datetime.now().timestamp()
+        self.last_raw_read = None
         license_plates, confidences, areas = self._process_license_plate(
             camera, id, license_plate_frame, debug_frame_id
         )
         self.plates_rec_second.update()
         self.plate_rec_speed.update(datetime.datetime.now().timestamp() - start)
+
+        if self.config.lpr.debug_save_plates:
+            frame_time = (
+                start if dedicated_lpr else obj_data.get("frame_time", start)  # type: ignore[union-attr]
+            )
+            self._bench_dump(
+                camera,
+                id,
+                debug_frame_id,
+                frame_time,
+                plate_box,
+                license_plate_frame,
+                license_plates,
+                confidences,
+            )
 
         if license_plates:
             for plate, confidence, text_area in zip(license_plates, confidences, areas):
