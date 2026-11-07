@@ -176,6 +176,7 @@ class EmbeddingMaintainer(threading.Thread):
                 self.requestor,
                 device=self.config.lpr.device,
                 model_size=self.config.lpr.model_size,
+                recognition_model=self.config.lpr.recognition_model,
             )
 
         # realtime processors

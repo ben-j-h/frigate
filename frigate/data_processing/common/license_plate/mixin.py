@@ -203,6 +203,73 @@ class LicensePlateProcessingMixin:
 
         return self.ctc_decoder(outputs)
 
+    def _apply_replace_rules(self, camera: str, plate: str) -> str:
+        """Apply the configured regex replace rules to a recognized plate string."""
+        original = plate
+        for rule in self.lpr_config.replace_rules or []:
+            try:
+                pattern = getattr(rule, "pattern", "")
+                replacement = getattr(rule, "replacement", "")
+                if pattern:
+                    plate = re.sub(pattern, replacement, plate)
+                    logger.debug(
+                        f"{camera}: Processing replace rule: '{pattern}' -> '{replacement}', result: '{plate}'"
+                    )
+            except re.error as e:
+                logger.warning(
+                    f"{camera}: Invalid regex in replace_rules '{pattern}': {e}"
+                )
+
+        if plate != original:
+            logger.debug(f"{camera}: All rules applied: '{original}' -> '{plate}'")
+
+        return plate
+
+    def _process_license_plate_whole(
+        self, camera: str, id: str, image: np.ndarray, debug_frame_id: int
+    ) -> tuple[list[str], list[list[float]], list[int]]:
+        """Read the whole plate crop with a single-pass plate OCR model.
+
+        Same contract as _process_license_plate: plate texts, per-character
+        confidences and areas, best first, only results that pass
+        recognition_threshold.
+        """
+        model = self.model_runner.plate_ocr_model
+
+        if model is None or model.runner is None:
+            logger.debug("Plate OCR model runner not loaded")
+            return [], [], []
+
+        if self.config.lpr.debug_save_plates:
+            logger.debug(f"{camera}: Saving plates for event {id}")
+            Path(os.path.join(CLIPS_DIR, f"lpr/{camera}/{id}")).mkdir(
+                parents=True, exist_ok=True
+            )
+            cv2.imwrite(
+                os.path.join(CLIPS_DIR, f"lpr/{camera}/{id}/{debug_frame_id}_1.jpg"),
+                image,
+            )
+
+        try:
+            plate, confidences = model.read([image])[0]
+        except Exception as e:
+            logger.warning(f"Error running plate OCR model: {e}")
+            return [], [], []
+
+        if not plate:
+            return [], [], []
+
+        avg_conf = sum(confidences) / len(confidences)
+        logger.debug(
+            f"{camera}: Plate OCR read {plate} (average confidence: {avg_conf:.2f})"
+        )
+
+        if avg_conf < self.lpr_config.recognition_threshold:
+            return [], [], []
+
+        plate = self._apply_replace_rules(camera, plate)
+        return [plate], [confidences], [image.shape[0] * image.shape[1]]
+
     def _process_license_plate(
         self, camera: str, id: str, image: np.ndarray, debug_frame_id: int
     ) -> tuple[list[str], list[list[float]], list[int]]:
@@ -221,6 +288,9 @@ class LicensePlateProcessingMixin:
         Returns:
             Tuple[List[str], List[List[float]], List[int]]: Detected license plate texts, character-level confidence scores for each plate (flattened into a single list per plate), and areas of the plates.
         """
+        if self.model_runner.plate_ocr_model is not None:
+            return self._process_license_plate_whole(camera, id, image, debug_frame_id)
+
         if (
             self.model_runner.detection_model.runner is None
             or self.model_runner.classification_model.runner is None
@@ -381,29 +451,7 @@ class LicensePlateProcessingMixin:
                 conf for conf_list in qualifying_confidences for conf in conf_list
             ]
 
-            # Apply replace rules to combined_plate if configured
-            original_combined = combined_plate
-            if self.lpr_config.replace_rules:
-                for rule in self.lpr_config.replace_rules:
-                    try:
-                        pattern = getattr(rule, "pattern", "")
-                        replacement = getattr(rule, "replacement", "")
-                        if pattern:
-                            combined_plate = re.sub(
-                                pattern, replacement, combined_plate
-                            )
-                            logger.debug(
-                                f"{camera}: Processing replace rule: '{pattern}' -> '{replacement}', result: '{combined_plate}'"
-                            )
-                    except re.error as e:
-                        logger.warning(
-                            f"{camera}: Invalid regex in replace_rules '{pattern}': {e}"
-                        )
-
-            if combined_plate != original_combined:
-                logger.debug(
-                    f"{camera}: All rules applied: '{original_combined}' -> '{combined_plate}'"
-                )
+            combined_plate = self._apply_replace_rules(camera, combined_plate)
 
             # Compute the combined area for qualifying boxes
             qualifying_boxes = [boxes[i] for i in qualifying_indices]

@@ -12,6 +12,7 @@ __all__ = [
     "SemanticSearchConfig",
     "CameraSemanticSearchConfig",
     "LicensePlateRecognitionConfig",
+    "LPRRecognitionModelEnum",
 ]
 
 
@@ -328,6 +329,11 @@ class CameraFaceRecognitionConfig(FrigateBaseModel):
     model_config = ConfigDict(extra="forbid", protected_namespaces=())
 
 
+class LPRRecognitionModelEnum(str, Enum):
+    paddleocr = "paddleocr"
+    fast_plate_ocr = "fast_plate_ocr"
+
+
 class ReplaceRule(FrigateBaseModel):
     pattern: str = Field(..., title="Regex pattern")
     replacement: str = Field(..., title="Replacement string")
@@ -343,6 +349,11 @@ class LicensePlateRecognitionConfig(FrigateBaseModel):
         default=ModelSizeEnum.small,
         title="Model size",
         description="Model size used for text detection/recognition. Most users should use 'small'.",
+    )
+    recognition_model: LPRRecognitionModelEnum = Field(
+        default=LPRRecognitionModelEnum.paddleocr,
+        title="Recognition model",
+        description="OCR model that reads the plate text. 'paddleocr' finds text lines on the plate and reads each one; 'fast_plate_ocr' reads the whole plate crop in one pass with a model trained only on license plates (letters A-Z and digits). recognition_threshold applies to either.",
     )
     detection_threshold: float = Field(
         default=0.7,

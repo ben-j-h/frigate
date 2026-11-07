@@ -197,6 +197,7 @@ class CudaGraphRunner(BaseModelRunner):
             EnrichmentModelTypeEnum.jina_v1.value,
             EnrichmentModelTypeEnum.jina_v2.value,
             EnrichmentModelTypeEnum.yolov9_license_plate.value,
+            EnrichmentModelTypeEnum.fast_plate_ocr.value,
         ]
 
     # ORT performs two regular runs before it starts capturing, but on some

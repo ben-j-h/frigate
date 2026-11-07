@@ -13,3 +13,4 @@ class EnrichmentModelTypeEnum(str, Enum):
     jina_v2 = "jina_v2"
     paddleocr = "paddleocr"
     yolov9_license_plate = "yolov9_license_plate"
+    fast_plate_ocr = "fast_plate_ocr"
