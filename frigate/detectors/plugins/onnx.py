@@ -35,7 +35,8 @@ class ONNXDetectorConfig(BaseDetectorConfig):
     device: str = Field(
         default="AUTO",
         title="Device Type",
-        description="The device to use for ONNX inference (e.g. 'AUTO', 'CPU', 'GPU').",
+        description="The device to use for ONNX inference (e.g. 'AUTO', 'CPU', 'GPU', a GPU index such as '1', "
+        "or 'Tensorrt' / 'Tensorrt:<GPU index>' for TensorRT in FP16; set USE_FP16=False to keep TensorRT in FP32).",
     )
 
 
@@ -52,6 +53,8 @@ class ONNXDetector(DetectionApi):
             path,
             detector_config.device,
             model_type=detector_config.model.model_type,
+            # only the TensorRT provider reads this; it was never passed, so TensorRT detectors ran in FP32
+            requires_fp16=True,
         )
 
         self.onnx_model_type = detector_config.model.model_type

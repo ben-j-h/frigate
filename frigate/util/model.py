@@ -332,10 +332,15 @@ def get_ort_providers(
 
     providers = []
     options = []
+    # device is "AUTO", "CPU", a GPU index ("1"), "Tensorrt", or "Tensorrt:<GPU index>"
+    device_name, _, device_index = (device or "AUTO").partition(":")
+    if device_name.isdigit():
+        device_id = int(device_name)
+    else:
+        device_id = int(device_index) if device_index.isdigit() else 0
 
     for provider in ort.get_available_providers():
         if provider == "CUDAExecutionProvider":
-            device_id = 0 if (not device or not device.isdigit()) else int(device)
             providers.append(provider)
             options.append(
                 {
@@ -347,12 +352,11 @@ def get_ort_providers(
         elif provider == "TensorrtExecutionProvider":
             # TensorrtExecutionProvider uses too much memory without options to control it
             # so it is not enabled by default
-            if device == "Tensorrt":
+            if device_name == "Tensorrt":
                 os.makedirs(
                     os.path.join(MODEL_CACHE_DIR, "tensorrt/ort/trt-engines"),
                     exist_ok=True,
                 )
-                device_id = 0 if not device.isdigit() else int(device)
                 providers.append(provider)
                 options.append(
                     {

@@ -585,6 +585,24 @@ class RKNNModelRunner(BaseModelRunner):
                 pass
 
 
+def _warn_if_tensorrt_missing(
+    providers: list[str], session: ort.InferenceSession
+) -> bool:
+    """ONNX Runtime silently falls back to CUDA when the TensorRT libraries are absent
+    (the amd64 -tensorrt image has shipped without them since #19030)."""
+    if (
+        providers
+        and providers[0] == "TensorrtExecutionProvider"
+        and session.get_providers()[0] != "TensorrtExecutionProvider"
+    ):
+        logger.warning(
+            "TensorRT was requested but could not be loaded (are the TensorRT libraries installed?); "
+            f"running on {session.get_providers()[0]} instead"
+        )
+        return True
+    return False
+
+
 def get_optimized_runner(
     model_path: str, device: str | None, model_type: str, **kwargs
 ) -> BaseModelRunner:
@@ -606,22 +624,36 @@ def get_optimized_runner(
         if device != "CPU" and is_openvino_gpu_npu_available():
             return OpenVINOModelRunner(model_path, device, model_type, **kwargs)
 
-    if (
-        CudaGraphRunner.is_model_supported(model_type)
-        and providers[0] == "CUDAExecutionProvider"
+    if CudaGraphRunner.is_model_supported(model_type) and providers[0] in (
+        "CUDAExecutionProvider",
+        "TensorrtExecutionProvider",
     ):
+        # TensorRT needs its own switch for CUDA graphs; without them it is no faster than
+        # CUDA + graphs for small detectors (bench 2026-11-13: yolov9s 640 on an RTX 4080,
+        # CUDA graphs 4.55 ms, TensorRT FP16 4.22 ms, TensorRT FP16 + graphs 2.32 ms)
         options[0] = {
             **options[0],
-            "enable_cuda_graph": True,
+            (
+                "trt_cuda_graph_enable"
+                if providers[0] == "TensorrtExecutionProvider"
+                else "enable_cuda_graph"
+            ): True,
         }
-        return CudaGraphRunner(
-            ort.InferenceSession(
+        session = ort.InferenceSession(
+            model_path,
+            providers=providers,
+            provider_options=options,
+        )
+        if _warn_if_tensorrt_missing(providers, session):
+            # ORT fell back to CUDA but without the CUDA EP's own graph switch: rebuild on CUDA + graphs
+            providers, options = providers[1:], options[1:]
+            options[0] = {**options[0], "enable_cuda_graph": True}
+            session = ort.InferenceSession(
                 model_path,
                 providers=providers,
                 provider_options=options,
-            ),
-            options[0]["device_id"],
-        )
+            )
+        return CudaGraphRunner(session, options[0]["device_id"])
 
     if (
         providers
@@ -632,12 +664,11 @@ def get_optimized_runner(
         providers.pop(0)
         options.pop(0)
 
-    return ONNXModelRunner(
-        ort.InferenceSession(
-            model_path,
-            sess_options=get_ort_session_options(model_type),
-            providers=providers,
-            provider_options=options,
-        ),
-        model_type=model_type,
+    session = ort.InferenceSession(
+        model_path,
+        sess_options=get_ort_session_options(model_type),
+        providers=providers,
+        provider_options=options,
     )
+    _warn_if_tensorrt_missing(providers, session)
+    return ONNXModelRunner(session, model_type=model_type)
