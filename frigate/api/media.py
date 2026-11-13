@@ -2,6 +2,7 @@
 
 import asyncio
 import glob
+import json
 import logging
 import math
 import os
@@ -800,6 +801,9 @@ async def event_snapshot(
     event_complete = False
     jpg_bytes = None
     frame_time = 0
+    # the tracked object's box in the served frame (x1, y1, x2, y2 pixels), so a client gets the
+    # image and its box from one response instead of pairing it with a throttled MQTT update
+    frame_box = None
     try:
         event = Event.get(Event.id == event_id, Event.end_time != None)
         event_complete = True
@@ -825,6 +829,15 @@ async def event_snapshot(
             ].timestamp_style,
             colormap=request.app.frigate_config.model.colormap,
         )
+        box = (event.data or {}).get("box")
+        if box and not snapshot_settings["crop"] and not snapshot_settings["height"]:
+            detect = request.app.frigate_config.cameras[event.camera].detect
+            frame_box = [
+                round(box[0] * detect.width),
+                round(box[1] * detect.height),
+                round((box[0] + box[2]) * detect.width),
+                round((box[1] + box[3]) * detect.height),
+            ]
     except DoesNotExist:
         # see if the object is currently being tracked
         try:
@@ -846,6 +859,14 @@ async def event_snapshot(
                             height=snapshot_settings["height"],
                             quality=snapshot_settings["quality"],
                         )
+                        thumb = tracked_obj.thumbnail_data
+                        if (
+                            thumb is not None
+                            and thumb.get("frame_time") == frame_time
+                            and not snapshot_settings["crop"]
+                            and not snapshot_settings["height"]
+                        ):
+                            frame_box = [int(v) for v in thumb["box"]]
                         await require_camera_access(camera_state.name, request=request)
         except Exception:
             return JSONResponse(
@@ -869,6 +890,8 @@ async def event_snapshot(
         "Cache-Control": "private, max-age=31536000" if event_complete else "no-store",
         "X-Frame-Time": str(frame_time),
     }
+    if frame_box is not None:
+        headers["X-Box"] = json.dumps(frame_box)
 
     if params.download:
         headers["Content-Disposition"] = f"attachment; filename=snapshot-{event_id}.jpg"
