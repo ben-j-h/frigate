@@ -357,6 +357,15 @@ class CameraState:
         if self._discard_stale_resolution_state(current_detections):
             return
 
+        # Fork (bench dump): every person the tracker holds in THIS frame,
+        # confirmed or not, so a face crop can be checked against companions
+        # Frigate has not (re)confirmed as a tracked object yet.
+        self.frame_people = [
+            [obj_id, [int(v) for v in d["box"]]]
+            for obj_id, d in current_detections.items()
+            if d.get("label") == "person" and d.get("box") is not None
+        ]
+
         current_frame = self.frame_manager.get(
             frame_name, self.camera_config.frame_shape_yuv
         )

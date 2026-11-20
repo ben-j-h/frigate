@@ -117,6 +117,14 @@ class TrackedObjectProcessor(threading.Thread):
     def create_camera_state(self, camera: str) -> None:
         """Creates a new camera state."""
 
+        def with_frame_people(obj: TrackedObject) -> dict[str, Any]:
+            # Fork (bench dump): attach every person box of this frame,
+            # including unconfirmed tracks, for the face processor's `others`
+            data = obj.to_dict()
+            if data.get("label") == "person":
+                data["frame_people"] = getattr(camera_state, "frame_people", [])
+            return data
+
         def start(camera: str, obj: TrackedObject, frame_name: str) -> None:
             self.event_sender.publish(
                 (
@@ -124,7 +132,7 @@ class TrackedObjectProcessor(threading.Thread):
                     EventStateEnum.start,
                     camera,
                     frame_name,
-                    obj.to_dict(),
+                    with_frame_people(obj),
                 )
             )
 
@@ -147,7 +155,7 @@ class TrackedObjectProcessor(threading.Thread):
                     EventStateEnum.update,
                     camera,
                     frame_name,
-                    obj.to_dict(),
+                    with_frame_people(obj),
                 )
             )
 

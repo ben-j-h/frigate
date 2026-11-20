@@ -566,6 +566,55 @@ class FaceRealTimeProcessor(RealTimeProcessorApi):
             return face_area is None or face_area > 1.25 * best
         return True
 
+    def _bench_others(
+        self,
+        camera: str,
+        id: str,
+        obj_data: dict[str, Any],
+        frame_time: float,
+        region: list[int],
+    ) -> list[dict[str, Any]]:
+        """Other people whose box overlaps `region` (a face or person box).
+        First every person the tracker held in this exact frame
+        (`frame_people`, attached by the fork's object processor: includes
+        tracks Frigate has not confirmed yet, e.g. a companion between two
+        tracks), then confirmed tracks seen by this processor within 1 s
+        (`bench_people`, the only source before 2026-11-19). `unconfirmed`
+        marks a frame_people entry this processor has not seen as a track."""
+
+        def touches(b: list[int]) -> bool:
+            return (
+                b[0] < region[2]
+                and region[0] < b[2]
+                and b[1] < region[3]
+                and region[1] < b[3]
+            )
+
+        known = self.bench_people.get(camera, {})
+        others: list[dict[str, Any]] = []
+        seen = {id}
+        for other_id, b in obj_data.get("frame_people") or []:
+            if other_id in seen:
+                continue
+            seen.add(other_id)
+            if touches(b):
+                others.append(
+                    {
+                        "id": other_id,
+                        "box": [int(v) for v in b],
+                        "dt": 0.0,
+                        "unconfirmed": other_id not in known,
+                    }
+                )
+        for other_id, (t, b) in known.items():
+            if other_id in seen or abs(frame_time - t) > 1.0:
+                continue
+            if touches(b):
+                others.append(
+                    {"id": other_id, "box": b, "dt": round(t - frame_time, 3)}
+                )
+        return others
+
     def _bench_person(
         self,
         camera: str,
@@ -597,19 +646,7 @@ class FaceRealTimeProcessor(RealTimeProcessorApi):
             crop = yuv_box_to_bgr(frame, box)
             if crop is None:
                 return
-            others: list[dict[str, Any]] = []
-            for other_id, (t, ob) in self.bench_people.get(camera, {}).items():
-                if other_id == id or abs(frame_time - t) > 1.0:
-                    continue
-                if (
-                    ob[0] < box[2]
-                    and box[0] < ob[2]
-                    and ob[1] < box[3]
-                    and box[1] < ob[3]
-                ):
-                    others.append(
-                        {"id": other_id, "box": ob, "dt": round(t - frame_time, 3)}
-                    )
+            others = self._bench_others(camera, id, obj_data, frame_time, box)
             st[0] += 1
             st[1] = frame_time
             get_dump(self.config, "person", "person").save(
@@ -648,19 +685,7 @@ class FaceRealTimeProcessor(RealTimeProcessorApi):
         with the geometry needed to check the face belongs to this person."""
         try:
             frame_time = obj_data.get("frame_time", start)
-            others: list[dict[str, Any]] = []
-            for other_id, (t, box) in self.bench_people.get(camera, {}).items():
-                if other_id == id or abs(frame_time - t) > 1.0:
-                    continue
-                if (
-                    box[0] < face_box[2]
-                    and face_box[0] < box[2]
-                    and box[1] < face_box[3]
-                    and face_box[1] < box[3]
-                ):
-                    others.append(
-                        {"id": other_id, "box": box, "dt": round(t - frame_time, 3)}
-                    )
+            others = self._bench_others(camera, id, obj_data, frame_time, face_box)
             get_dump(self.config, "faces", "person").save(
                 camera,
                 id,
